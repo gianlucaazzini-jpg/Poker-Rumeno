@@ -1,0 +1,435 @@
+const WebSocket = require('ws');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    fs.createReadStream(path.join(__dirname, 'index.html')).pipe(res);
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+
+const wss = new WebSocket.Server({ server });
+
+// --- Card Logic ---
+const SUITS = ['♠', '♥', '♦', '♣'];
+const VALUES = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+const VALUE_RANK = { '2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14 };
+
+function createDeck() {
+  const deck = [];
+  for (const suit of SUITS)
+    for (const value of VALUES)
+      deck.push({ suit, value });
+  return deck;
+}
+
+function shuffle(deck) {
+  const d = [...deck];
+  for (let i = d.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [d[i], d[j]] = [d[j], d[i]];
+  }
+  return d;
+}
+
+// Hand rankings (higher = better)
+// 0: high card, 1: pair, 2: two pair, 3: three of a kind, 4: straight, 5: full house, 6: four of a kind, 7: straight flush (royal flush)
+function evaluateHand(cards) {
+  if (!cards || cards.length === 0) return { rank: -1, name: 'Nessuna carta', value: [] };
+
+  const counts = {};
+  for (const c of cards) counts[c.value] = (counts[c.value] || 0) + 1;
+  const freq = Object.values(counts).sort((a,b) => b-a);
+  const vals = cards.map(c => VALUE_RANK[c.value]).sort((a,b) => b-a);
+
+  // Check straight
+  const uniqueVals = [...new Set(vals)].sort((a,b) => b-a);
+  let isStraight = false;
+  if (uniqueVals.length >= 5) {
+    for (let i = 0; i <= uniqueVals.length - 5; i++) {
+      if (uniqueVals[i] - uniqueVals[i+4] === 4 &&
+          new Set(uniqueVals.slice(i, i+5)).size === 5) {
+        isStraight = true;
+        break;
+      }
+    }
+  }
+
+  // Check flush (straight flush)
+  const suitCounts = {};
+  for (const c of cards) suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
+  const flushSuit = Object.entries(suitCounts).find(([,v]) => v >= 5)?.[0];
+  let isStraightFlush = false;
+  if (flushSuit && isStraight) {
+    const flushCards = cards.filter(c => c.suit === flushSuit).map(c => VALUE_RANK[c.value]).sort((a,b)=>b-a);
+    for (let i = 0; i <= flushCards.length - 5; i++) {
+      if (flushCards[i] - flushCards[i+4] === 4 && new Set(flushCards.slice(i,i+5)).size === 5) {
+        isStraightFlush = true;
+        break;
+      }
+    }
+  }
+
+  if (isStraightFlush) return { rank: 7, name: 'Scala Reale', value: vals };
+  if (freq[0] === 4) return { rank: 6, name: 'Poker', value: vals };
+  if (freq[0] === 3 && freq[1] === 2) return { rank: 5, name: 'Full', value: vals };
+  if (isStraight) return { rank: 4, name: 'Scala', value: vals };
+  if (freq[0] === 3) return { rank: 3, name: 'Tris', value: vals };
+  if (freq[0] === 2 && freq[1] === 2) return { rank: 2, name: 'Doppia Coppia', value: vals };
+  if (freq[0] === 2) return { rank: 1, name: 'Coppia', value: vals };
+  return { rank: 0, name: 'Carta Alta', value: vals };
+}
+
+function compareHands(h1, h2) {
+  if (h1.rank !== h2.rank) return h1.rank - h2.rank;
+  for (let i = 0; i < Math.min(h1.value.length, h2.value.length); i++) {
+    if (h1.value[i] !== h2.value[i]) return h1.value[i] - h2.value[i];
+  }
+  return 0;
+}
+
+// All possible claim combinations ranked
+const HAND_NAMES = ['Carta Alta', 'Coppia', 'Doppia Coppia', 'Tris', 'Scala', 'Full', 'Poker', 'Scala Reale'];
+const HAND_RANKS = { 'Carta Alta':0,'Coppia':1,'Doppia Coppia':2,'Tris':3,'Scala':4,'Full':5,'Poker':6,'Scala Reale':7 };
+
+function buildClaimsList() {
+  // For each hand type, list possible sub-claims ordered by strength
+  const claims = [];
+  // Carta alta: A > K > Q > ... > 2
+  for (const v of [...VALUES].reverse()) claims.push({ type:'Carta Alta', detail: v, rank:0, subrank: VALUE_RANK[v] });
+  // Coppia
+  for (const v of [...VALUES].reverse()) claims.push({ type:'Coppia', detail: `di ${v}`, rank:1, subrank: VALUE_RANK[v] });
+  // Doppia Coppia
+  for (let i = VALUES.length-1; i >= 1; i--)
+    for (let j = i-1; j >= 0; j--)
+      claims.push({ type:'Doppia Coppia', detail: `${VALUES[i]}+${VALUES[j]}`, rank:2, subrank: VALUE_RANK[VALUES[i]]*100+VALUE_RANK[VALUES[j]] });
+  // Tris
+  for (const v of [...VALUES].reverse()) claims.push({ type:'Tris', detail: `di ${v}`, rank:3, subrank: VALUE_RANK[v] });
+  // Scala: highest card
+  for (const v of VALUES.slice(4).reverse()) claims.push({ type:'Scala', detail: `fino a ${v}`, rank:4, subrank: VALUE_RANK[v] });
+  // Full
+  for (let i = VALUES.length-1; i >= 0; i--)
+    for (let j = VALUES.length-1; j >= 0; j--)
+      if (i !== j) claims.push({ type:'Full', detail: `${VALUES[i]}s su ${VALUES[j]}s`, rank:5, subrank: VALUE_RANK[VALUES[i]]*100+VALUE_RANK[VALUES[j]] });
+  // Poker
+  for (const v of [...VALUES].reverse()) claims.push({ type:'Poker', detail: `di ${v}`, rank:6, subrank: VALUE_RANK[v] });
+  // Scala Reale
+  claims.push({ type:'Scala Reale', detail: '', rank:7, subrank: 14 });
+  return claims;
+}
+
+const ALL_CLAIMS = buildClaimsList();
+
+function claimIndex(claim) {
+  return ALL_CLAIMS.findIndex(c => c.type === claim.type && c.detail === claim.detail);
+}
+
+// Check if a claim is satisfied by the combined cards on the table
+function isClaimed(claim, allCards) {
+  const hand = evaluateHand(allCards);
+  if (hand.rank < HAND_RANKS[claim.type]) return false;
+  if (hand.rank > HAND_RANKS[claim.type]) return true;
+  // Same rank - check detail
+  if (claim.type === 'Carta Alta') {
+    return allCards.some(c => VALUE_RANK[c.value] >= VALUE_RANK[claim.detail]);
+  }
+  if (claim.type === 'Coppia') {
+    const val = claim.detail.replace('di ','');
+    const counts = {};
+    for (const c of allCards) counts[c.value] = (counts[c.value]||0)+1;
+    return Object.entries(counts).some(([v,n]) => n>=2 && VALUE_RANK[v]>=VALUE_RANK[val]);
+  }
+  if (claim.type === 'Doppia Coppia') {
+    const parts = claim.detail.split('+');
+    const counts = {};
+    for (const c of allCards) counts[c.value] = (counts[c.value]||0)+1;
+    const pairs = Object.entries(counts).filter(([,n])=>n>=2).map(([v])=>VALUE_RANK[v]).sort((a,b)=>b-a);
+    if (pairs.length < 2) return false;
+    return pairs[0] >= VALUE_RANK[parts[0]] && pairs[1] >= VALUE_RANK[parts[1]];
+  }
+  if (claim.type === 'Tris') {
+    const val = claim.detail.replace('di ','');
+    const counts = {};
+    for (const c of allCards) counts[c.value] = (counts[c.value]||0)+1;
+    return Object.entries(counts).some(([v,n]) => n>=3 && VALUE_RANK[v]>=VALUE_RANK[val]);
+  }
+  if (claim.type === 'Scala') {
+    const topVal = VALUE_RANK[claim.detail.replace('fino a ','')];
+    const vals = [...new Set(allCards.map(c=>VALUE_RANK[c.value]))].sort((a,b)=>a-b);
+    for (let i = 0; i <= vals.length-5; i++) {
+      if (vals[i+4]-vals[i]===4 && new Set(vals.slice(i,i+5)).size===5 && vals[i+4]>=topVal) return true;
+    }
+    return false;
+  }
+  if (claim.type === 'Full') {
+    const counts = {};
+    for (const c of allCards) counts[c.value] = (counts[c.value]||0)+1;
+    const threes = Object.entries(counts).filter(([,n])=>n>=3).map(([v])=>VALUE_RANK[v]);
+    const twos = Object.entries(counts).filter(([,n])=>n>=2).map(([v])=>VALUE_RANK[v]);
+    const parts = claim.detail.split(' su ');
+    const needThree = VALUE_RANK[parts[0].replace('s','')];
+    const needTwo = VALUE_RANK[parts[1].replace('s','')];
+    return threes.some(v=>v>=needThree) && twos.filter(v=>v!==threes[0]).some(v=>v>=needTwo);
+  }
+  if (claim.type === 'Poker') {
+    const val = claim.detail.replace('di ','');
+    const counts = {};
+    for (const c of allCards) counts[c.value] = (counts[c.value]||0)+1;
+    return Object.entries(counts).some(([v,n]) => n>=4 && VALUE_RANK[v]>=VALUE_RANK[val]);
+  }
+  if (claim.type === 'Scala Reale') {
+    for (const suit of SUITS) {
+      const suitVals = allCards.filter(c=>c.suit===suit).map(c=>VALUE_RANK[c.value]).sort((a,b)=>a-b);
+      for (let i=0;i<=suitVals.length-5;i++) {
+        if (suitVals[i+4]-suitVals[i]===4 && new Set(suitVals.slice(i,i+5)).size===5) return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+// --- Game State ---
+const rooms = {};
+
+function createRoom(roomId) {
+  return {
+    id: roomId,
+    players: [], // { id, name, ws, cards, eliminated }
+    state: 'waiting', // waiting, playing, roundEnd
+    deck: [],
+    currentPlayerIndex: 0,
+    currentClaim: null,
+    currentClaimIndex: -1,
+    lastClaimPlayerId: null,
+    round: 0,
+  };
+}
+
+function broadcast(room, msg, excludeId = null) {
+  for (const p of room.players) {
+    if (p.id !== excludeId && p.ws.readyState === WebSocket.OPEN) {
+      p.ws.send(JSON.stringify(msg));
+    }
+  }
+}
+
+function broadcastAll(room, msg) {
+  broadcast(room, msg);
+}
+
+function sendTo(player, msg) {
+  if (player.ws.readyState === WebSocket.OPEN)
+    player.ws.send(JSON.stringify(msg));
+}
+
+function gameStateForPlayer(room, playerId) {
+  const activePlayers = room.players.filter(p => !p.eliminated);
+  return {
+    type: 'gameState',
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      cardCount: p.cards.length,
+      eliminated: p.eliminated,
+      isYou: p.id === playerId,
+      cards: p.id === playerId ? p.cards : null,
+    })),
+    currentPlayerId: activePlayers[room.currentPlayerIndex % activePlayers.length]?.id,
+    currentClaim: room.currentClaim,
+    state: room.state,
+    round: room.round,
+    lastClaimPlayerId: room.lastClaimPlayerId,
+  };
+}
+
+function sendGameState(room) {
+  for (const p of room.players) {
+    sendTo(p, gameStateForPlayer(room, p.id));
+  }
+}
+
+function startRound(room) {
+  room.state = 'playing';
+  room.round++;
+  room.currentClaim = null;
+  room.currentClaimIndex = -1;
+  room.lastClaimPlayerId = null;
+
+  // Deal 2 cards to each active player (keep existing penalty cards)
+  room.deck = shuffle(createDeck());
+  const activePlayers = room.players.filter(p => !p.eliminated);
+  for (const p of activePlayers) {
+    if (p.cards.length < 2) {
+      const needed = 2 - p.cards.length;
+      p.cards.push(...room.deck.splice(0, needed));
+    }
+  }
+  room.currentPlayerIndex = 0;
+  broadcastAll(room, { type: 'roundStart', round: room.round });
+  sendGameState(room);
+}
+
+function nextTurn(room) {
+  const active = room.players.filter(p => !p.eliminated);
+  room.currentPlayerIndex = (room.currentPlayerIndex + 1) % active.length;
+  sendGameState(room);
+}
+
+function resolveDoubt(room, doubter) {
+  const allCards = room.players.filter(p=>!p.eliminated).flatMap(p=>p.cards);
+  const claimValid = isClaimed(room.currentClaim, allCards);
+  const claimer = room.players.find(p => p.id === room.lastClaimPlayerId);
+
+  let loser;
+  if (claimValid) {
+    // doubter was wrong
+    loser = doubter;
+  } else {
+    // claimer was wrong
+    loser = claimer;
+  }
+
+  // Give loser a penalty card
+  if (room.deck.length === 0) room.deck = shuffle(createDeck());
+  loser.cards.push(...room.deck.splice(0, 1));
+
+  const allCardsReveal = room.players.filter(p=>!p.eliminated).map(p=>({ id:p.id, name:p.name, cards:p.cards }));
+
+  broadcastAll(room, {
+    type: 'doubtResolved',
+    doublerId: doubter.id,
+    claimerId: claimer?.id,
+    claim: room.currentClaim,
+    claimValid,
+    loserId: loser.id,
+    loserName: loser.name,
+    allCards: allCardsReveal,
+  });
+
+  // Check elimination
+  if (loser.cards.length > 6) {
+    loser.eliminated = true;
+    broadcastAll(room, { type: 'playerEliminated', playerId: loser.id, playerName: loser.name });
+  }
+
+  const activePlayers = room.players.filter(p => !p.eliminated);
+  if (activePlayers.length <= 1) {
+    room.state = 'ended';
+    broadcastAll(room, { type: 'gameOver', winnerId: activePlayers[0]?.id, winnerName: activePlayers[0]?.name });
+    return;
+  }
+
+  // Start new round after delay
+  setTimeout(() => {
+    // Reset cards for new round
+    for (const p of room.players.filter(p=>!p.eliminated)) {
+      if (p.id === loser.id) {
+        // loser keeps their cards (already has the penalty)
+      } else {
+        p.cards = [];
+      }
+    }
+    startRound(room);
+  }, 4000);
+}
+
+wss.on('connection', (ws) => {
+  let playerId = Math.random().toString(36).substr(2, 9);
+  let currentRoom = null;
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+
+    if (msg.type === 'join') {
+      const { roomId, playerName } = msg;
+      if (!rooms[roomId]) rooms[roomId] = createRoom(roomId);
+      currentRoom = rooms[roomId];
+
+      if (currentRoom.state !== 'waiting') {
+        sendTo({ ws }, { type: 'error', message: 'Partita già iniziata' });
+        return;
+      }
+      if (currentRoom.players.length >= 6) {
+        sendTo({ ws }, { type: 'error', message: 'Stanza piena' });
+        return;
+      }
+
+      const player = { id: playerId, name: playerName, ws, cards: [], eliminated: false };
+      currentRoom.players.push(player);
+
+      sendTo(player, { type: 'joined', playerId, roomId });
+      broadcastAll(currentRoom, {
+        type: 'playerJoined',
+        players: currentRoom.players.map(p => ({ id: p.id, name: p.name }))
+      });
+    }
+
+    else if (msg.type === 'startGame') {
+      if (!currentRoom) return;
+      if (currentRoom.players.length < 2) {
+        sendTo(currentRoom.players.find(p=>p.id===playerId), { type:'error', message:'Servono almeno 2 giocatori' });
+        return;
+      }
+      startRound(currentRoom);
+    }
+
+    else if (msg.type === 'claim') {
+      if (!currentRoom || currentRoom.state !== 'playing') return;
+      const active = currentRoom.players.filter(p=>!p.eliminated);
+      const currentPlayer = active[currentRoom.currentPlayerIndex % active.length];
+      if (currentPlayer?.id !== playerId) return;
+
+      const claimIdx = claimIndex(msg.claim);
+      if (claimIdx <= currentRoom.currentClaimIndex) {
+        sendTo(currentPlayer, { type:'error', message:'Devi dichiarare qualcosa di più alto!' });
+        return;
+      }
+
+      currentRoom.currentClaim = msg.claim;
+      currentRoom.currentClaimIndex = claimIdx;
+      currentRoom.lastClaimPlayerId = playerId;
+
+      broadcastAll(currentRoom, {
+        type: 'claimMade',
+        playerId,
+        playerName: currentPlayer.name,
+        claim: msg.claim,
+      });
+
+      nextTurn(currentRoom);
+    }
+
+    else if (msg.type === 'doubt') {
+      if (!currentRoom || currentRoom.state !== 'playing') return;
+      if (!currentRoom.currentClaim) return;
+      const active = currentRoom.players.filter(p=>!p.eliminated);
+      const currentPlayer = active[currentRoom.currentPlayerIndex % active.length];
+      if (currentPlayer?.id !== playerId) return;
+      if (currentRoom.lastClaimPlayerId === playerId) return;
+
+      const doubter = currentRoom.players.find(p=>p.id===playerId);
+      resolveDoubt(currentRoom, doubter);
+    }
+  });
+
+  ws.on('close', () => {
+    if (currentRoom) {
+      const p = currentRoom.players.find(p=>p.id===playerId);
+      if (p) {
+        broadcastAll(currentRoom, { type:'playerLeft', playerId, playerName: p.name });
+        currentRoom.players = currentRoom.players.filter(p=>p.id!==playerId);
+        if (currentRoom.players.length === 0) delete rooms[currentRoom.id];
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Poker Polacco server running on port ${PORT}`));
